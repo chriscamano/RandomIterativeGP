@@ -2,7 +2,7 @@ import torch
 from linear_operator.utils.cholesky import psd_safe_cholesky
 
 import torch
-from gpytorch.functions import pivoted_cholesky
+# from gpytorch.functions import pivoted_cholesky
 from torch import jit
 
 
@@ -12,41 +12,57 @@ from typing import Callable
 
 import torch
 
-def _pivoted_cholesky(x, kernel_fn, outputscale, rank=100):
+import torch
+
+
+
+import torch
+
+import torch
+import torch
+
+def _pivoted_cholesky(x, kernel_fn, outputscale, rank=100, epsilon=1e-8, jitter=1e-6):
     n = x.shape[0]
-    L = torch.zeros((rank, n), device=x.device)
-    d = (outputscale ** 2) * torch.ones(n, device=x.device)
+    L = torch.zeros((rank, n), device=x.device, dtype=x.dtype)
+    d = outputscale**2 * torch.ones(n, device=x.device, dtype=x.dtype)
     pi = torch.arange(n, device=x.device)
-    
+
     for m in range(rank):
         # Find pivot: index of maximum value in d[m:]
         pivot_relative = torch.argmax(d[m:]).item()
         i = m + pivot_relative
 
-        # Swap entries in pi at indices m and i
-        temp = pi[m].clone()
-        pi[m] = pi[i]
-        pi[i] = temp
+        # Swap entries in pi; clone if needed to break dependencies
+        if i != m:
+            pi = pi.clone()
+            temp = pi[m].clone()
+            pi[m] = pi[i]
+            pi[i] = temp
 
-        # Set the m-th row pivot entry: L[m, pi[m]] = sqrt(d[pi[m]])
-        L[m, pi[m]] = torch.sqrt(d[pi[m]])
-        
+        # Use clamped value for the pivot to avoid sqrt of negative/zero
+        pivot_val = torch.clamp(d[pi[m]], min=epsilon)
+        denom = torch.sqrt(pivot_val)
+        L[m, pi[m]] = denom
+
         # Compute kernel evaluations between the pivot and the remaining points
-        # Unsqueeze the pivot to match dimensions: from [features] to [1, features]
-        a = kernel_fn(x[pi[m]].unsqueeze(0), x[pi[m+1:]]).squeeze(0)  # Expected shape: (n - m - 1,)
+        a = kernel_fn(x[pi[m]].unsqueeze(0), x[pi[m+1:]]).squeeze(0)
         
-        # Compute correction from previous rows:
+        # Compute correction from previous rows, if any
         if m > 0:
-            correction = torch.sum(L[:m, pi[m]].unsqueeze(1) * L[:m, pi[m+1:]], dim=0)
+            temp1 = L[:m, pi[m]].clone()
+            temp2 = L[:m, pi[m+1:]].clone()
+            correction = torch.sum(temp1.unsqueeze(1) * temp2, dim=0)
         else:
             correction = 0.0
 
-        # Compute the new elements for L's m-th row for the remaining indices
-        l = (a - correction) / L[m, pi[m]]
+        # Compute new elements for L's m-th row for the remaining indices
+        l = (a - correction) / denom
         L[m, pi[m+1:]] = l
 
-        # Update the residual diagonal values for the remaining indices
-        d[pi[m+1:]] = d[pi[m+1:]] - (l ** 2)
+        # Update d for the remaining indices using an out-of-place update
+        d_updated = d[pi[m+1:]] - (l ** 2)
+        # Clamp to ensure non-negativity and add jitter
+        d = d.index_copy(0, pi[m+1:], torch.clamp(d_updated, min=epsilon) + jitter)
     
     return L
 
@@ -58,6 +74,7 @@ def identity_precon(x: torch.Tensor) -> torch.Tensor:
 import torch
 
 def build_cholesky(X: torch.Tensor, kernel: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], noise: float, rank: int):
+    # L=pivoted_cholesky(X, rank, error_tol=1e-14)
     L = _pivoted_cholesky(X, kernel, kernel.outputscale, rank=rank)  # L has shape (rank, n)
     noise_inv2 = noise ** -2
     noise_inv4 = noise ** -4

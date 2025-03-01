@@ -83,9 +83,9 @@ class CholeskyGaussianProcess(AbstractGaussianProcess):
         
         X = X.to(dtype=self.dtype, device=self.device)
         K_trans = self.kernel(X, self.X_train).to_dense()
-        K = self.kernel(X, X).evaluate()
+        K = self.kernel(X, X)
         if self.compute_covariance:
-            mean = K_trans @ self.alpha
+            mean = K_trans.matmul( self.alpha)
             v = torch.cholesky_solve(K_trans.t(), self.L)
             covariance = K - K_trans @ v
             return mean.detach().squeeze(-1), covariance.detach().squeeze(-1)
@@ -102,6 +102,8 @@ class CholeskyGaussianProcess(AbstractGaussianProcess):
 
         return mll
 
+
+import torch
 
 class IterativeGaussianProcess(AbstractGaussianProcess):
     def __init__(self, kernel, noise=0.1, dtype=torch.float32, device="cuda:0",
@@ -181,13 +183,9 @@ class IterativeGaussianProcess(AbstractGaussianProcess):
         # with torch.no_grad():
 
         self.get_preconditioner(self.X_train)
-
-        if self.K_train ==None:
-            self.K_train = self.kernel(self.X_train, self.X_train).evaluate()
-            self.K_train.requires_grad_(True)  # Ensure it tracks gradients
-
+        self.K_lazy = self.kernel(self.X_train, self.X_train)
         def matmul_closure(b):
-            return self.K_train @ b + self.noise.get_value()**2 * b
+            return self.K_lazy.matmul(b) + self.noise.get_value()**2 * b
 
 
         #-------- Setup RHS of mbCG -------- 
@@ -196,7 +194,6 @@ class IterativeGaussianProcess(AbstractGaussianProcess):
 
         if self.num_probes > 0:
             if self.precon_type == "piv_chol":
-                print(self.L_k.shape)
                 k = self.L_k.shape[1]
                 # Sample z1 ~ NORMAL(0, I_k) and z2 ~ NORMAL(0, I_n)
                 z1 = torch.randn((k, self.num_probes), dtype=self.dtype, device=self.device)
@@ -306,26 +303,7 @@ class IterativeGaussianProcess(AbstractGaussianProcess):
         else:
             return predictive_mean,0
 
-
-    # def compute_mll(self, y):
-    #     #https://arxiv.org/pdf/2107.00243
-
-    #     y = y.to(dtype=self.dtype, device=self.device)
-    #     n = y.shape[0]
-
-    #     #---- Lancoz Quadrature ----
-    #     tau_P_log = torch.logdet(self.preconditioner_matrix)
-    #     T_stack = torch.stack(self.lanczos_iterates, dim=0)
-    #     eigenvals, eigenvecs = torch.linalg.eigh(T_stack)
-    #     weights = eigenvecs[:, 0, :] ** 2
-    #     gamma = torch.sum(weights * torch.log(eigenvals), dim=1)
-    #     gamma_sum = torch.sum(gamma)
-
-    #     tau_star_log = tau_P_log + (n / self.num_probes) * gamma_sum
-    #     quadratic = y.T @ self.alpha
-    #     const_term = torch.log(torch.tensor(2 * torch.pi, dtype=self.dtype, device=self.device))
-    #     mll = 0.5 * (quadratic + tau_star_log + n * const_term)
-    #     return mll     
+  
 
     def compute_mll(self, y):
         """
@@ -365,53 +343,7 @@ class IterativeGaussianProcess(AbstractGaussianProcess):
         #print("quadratic term",quadratic,"log det approx",tau_star_log,"constant",const_term)
         return mll
 
-    # def estimate_mll_gradient(self,train_x):
-    #     kernel = self.kernel
-    #     noise_param = self.noise.u
-    #     n = self.X_train.shape[0]
-    #     u0 = self.alpha.view(-1, 1)
-    #     U = self.probe_solutions
-    #     Z = self.Z
-    #     P_inv = torch.linalg.inv(self.preconditioner_matrix)
-        
-    #     u0_flat = u0.reshape(-1)
-    #     u0_outer = torch.outer(u0_flat, u0_flat)
-    #     P_inv_Z = torch.matmul(P_inv, Z)
-    #     t = Z.shape[1]
-        
-    #     outer_products = torch.zeros((t, n, n), device=self.X_train.device)
-    #     for i in range(t):
-    #         outer_products[i] = torch.outer(P_inv_Z[:, i], U[:, i])
-        
-    #     summed_outer = outer_products.sum(dim=0) / t
-    #     for param in kernel.parameters():
-    #         param.requires_grad_(True)
-        
-    #     K = self.kernel(self.K_train,self.K_train).evaluate()+ self.noise.get_value()**2 *torch.eye(self.X_train.shape[0],device=self.device)
-        
-    #     param_grads = {}
-    #     params_list = list(filter(lambda p: p.requires_grad, kernel.parameters()))
-    #     param_names = [name for name, param in kernel.named_parameters() if param.requires_grad]
-    #     grads_term1 = torch.autograd.grad(
-    #         K, params_list, grad_outputs=u0_outer, retain_graph=True, create_graph=False
-    #     )
-        
-    #     grads_term2 = torch.autograd.grad(
-    #         K, params_list, grad_outputs=summed_outer, retain_graph=True, create_graph=False
-    #     )
-        
-    #     for i, (param_name, grad1, grad2) in enumerate(zip(param_names, grads_term1, grads_term2)):
-    #         param_grads[param_name] = 0.5 * (grad1 + grad2)
-        
-    #     trace_u0 = torch.trace(u0_outer)
-    #     trace_summed = torch.trace(summed_outer)
 
-    #     noise_value = self.noise.get_value() 
-    #     noise_u = self.noise.u
-    #     noise_grad_estimate = noise_value * torch.sigmoid(noise_u) * (trace_u0 + trace_summed)
-    #     param_grads["noise"] = noise_grad_estimate
-        
-    #     return param_grads
     def estimate_mll_gradient(self, train_x):
         """
         Estimate gradients of the MLL with respect to kernel parameters using
