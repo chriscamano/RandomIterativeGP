@@ -206,15 +206,18 @@ def linear_cg(
     return x0
 
 
-def initialize_cg(matmul_closure, rhs, stop_updating_after, eps, preconditioner):
-    initial_guess = torch.zeros_like(rhs)
+def init_cg(matmul_closure, rhs, stop_updating_after, eps, preconditioner, initial_guess=None):
+    # If no initial guess is provided, use zeros init saving one lazy matmul
+    if initial_guess is None:
+        initial_guess = torch.zeros_like(rhs)
+        residual = rhs.clone()
+    else:
+        # Assume a non-zero warm start was provided. 
+        residual = rhs - matmul_closure(initial_guess)
+    
     eps = torch.tensor(eps, dtype=rhs.dtype, device=rhs.device)
-
-    residual = rhs - matmul_closure(initial_guess)
     batch_shape = residual.shape[:-2]
-
     result = initial_guess.expand_as(residual).contiguous()
-
     residual_norm = residual.norm(2, dim=-2, keepdim=True)
     has_converged = torch.lt(residual_norm, stop_updating_after)
 
@@ -227,17 +230,60 @@ def take_cg_step(Ap0, x0, r0, gamma0, p0, alpha, beta, z0, mul_storage, has_conv
     is_small = dot < eps
     alpha_new = gamma0 / torch.where(is_small, torch.ones_like(dot), dot)
     alpha_new = torch.where(is_small | has_converged, torch.zeros_like(alpha_new), alpha_new)
+    
     r_new = r0 - alpha_new * Ap0
     x_new = x0 + alpha_new * p0
+
     precond_residual = precon(r_new)
     new_gamma = torch.sum(r_new * precond_residual, dim=-2, keepdim=True)
     is_small_gamma = gamma0 < eps
     beta_new = new_gamma / torch.where(is_small_gamma, torch.ones_like(gamma0), gamma0)
     beta_new = torch.where(is_small_gamma, torch.zeros_like(beta_new), beta_new)
+    
     p_new = precond_residual + beta_new * p0
+
+    
     return x_new, r_new, new_gamma, beta_new, p_new, alpha_new
 
+import torch
 
+def take_cg_step_stable(Ap0, x0, r0, gamma0, p0, alpha, beta, z0, mul_storage, has_converged, eps, is_zero, precon):
+    # Compute the dot product needed for alpha (equivalent to d_k^T K(d_k))
+    dot = torch.sum(p0 * Ap0, dim=-2, keepdim=True)
+    is_small = dot < eps
+
+    # Compute alpha in the log-domain for enhanced stability:
+    # alpha = exp(log(gamma0) - log(dot))
+    # Add eps to avoid taking log of zero.
+    log_gamma0 = torch.log(gamma0 + eps)
+    log_dot = torch.log(torch.where(is_small, torch.ones_like(dot), dot))
+    alpha_new = torch.exp(log_gamma0 - log_dot)
+    alpha_new = torch.where(is_small | has_converged, torch.zeros_like(alpha_new), alpha_new)
+
+    # Update solution and residual (note the sign convention in your implementation)
+    x_new = x0 + alpha_new * p0
+    r_new = r0 - alpha_new * Ap0
+
+    # Reorthogonalization: subtract projections onto previously stored vectors u_j
+    for u in mul_storage:
+        proj = torch.sum(u * r_new, dim=-2, keepdim=True)
+        r_new = r_new - proj * u
+
+    # Apply the preconditioner to the reorthogonalized residual
+    precond_residual = precon(r_new)
+    new_gamma = torch.sum(r_new * precond_residual, dim=-2, keepdim=True)
+
+    # Compute beta in the log-domain: beta = exp(log(new_gamma) - log(gamma0))
+    is_small_gamma = gamma0 < eps
+    log_new_gamma = torch.log(new_gamma + eps)
+    beta_new = torch.exp(log_new_gamma - log_gamma0)
+    beta_new = torch.where(is_small_gamma, torch.zeros_like(beta_new), beta_new)
+
+    # Update the search direction
+    p_new = precond_residual + beta_new * p0
+
+    return x_new, r_new, new_gamma, beta_new, p_new, alpha_new
+    
 def create_placeholders(rhs, residual, preconditioner, batch_shape):
     precond_residual = preconditioner(residual)
     curr_conjugate_vec = precond_residual
@@ -258,7 +304,13 @@ def cond_fn(k, max_iter, tolerance, residual, has_converged, residual_norm, stop
     new_residual_norm = torch.norm(residual, 2, dim=-2, keepdim=True)
     new_residual_norm = torch.where(rhs_is_zero, torch.zeros_like(new_residual_norm), new_residual_norm)
     new_has_converged = new_residual_norm < stop_updating_after
-    flag = k >= min(10, max_iter - 1) and bool(new_residual_norm.mean() < tolerance)
+    if k < min(10, max_iter - 1):
+        flag = False
+    else:
+        #Implicit mean comparison
+        total = new_residual_norm.sum()
+        count = new_residual_norm.numel()
+        flag = torch.lt(total, tolerance * count)
     return flag
 
 

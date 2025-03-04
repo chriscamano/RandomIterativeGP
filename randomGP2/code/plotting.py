@@ -14,6 +14,13 @@ def plot_gp_simple(train_x, train_y, test_x, GP_mean, std, test_y):
       std: predictive standard deviation at test inputs
       test_y: true function values at test inputs
     """
+    train_x=train_x.to("cpu")
+    train_y=train_y.to("cpu")
+    test_x=test_x.to("cpu")
+    GP_mean=GP_mean.to("cpu")
+    std=std.to("cpu")
+    test_y=test_y.to("cpu")
+
     # Convert inputs to 1D numpy arrays.
     x_vals = np.array(test_x).ravel()
     GP_mean = np.array(GP_mean).ravel()
